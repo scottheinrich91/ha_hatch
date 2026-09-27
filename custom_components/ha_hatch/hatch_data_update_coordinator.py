@@ -2,7 +2,9 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import timedelta, UTC, datetime
 from inspect import isawaitable
+import json
 from logging import getLogger, Logger
+import os
 import traceback
 from typing import Final
 
@@ -247,6 +249,61 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
             f"Retry backoff active until {retry_at.isoformat()} for {self.email}"
         )
 
+    def _load_custom_sounds(self) -> None:
+        """Load optional custom sound mapping from custom_sounds.json if present."""
+        if not self.rest_devices:
+            return
+
+        config_paths = [
+            self.hass.config.path("custom_components", "ha_hatch", "custom_sounds.json"),
+            self.hass.config.path("hatch_custom_sounds.json"),
+            os.path.join(os.path.dirname(__file__), "custom_sounds.json"),
+        ]
+
+        custom_sounds = None
+        loaded_path = None
+        for path in config_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        custom_sounds = json.load(f)
+                    loaded_path = path
+                    break
+                except Exception as err:
+                    _LOGGER.error("Failed to load custom sounds from %s: %s", path, err)
+
+        if not custom_sounds or not isinstance(custom_sounds, list):
+            return
+
+        _LOGGER.info("Loaded %d custom sounds from %s", len(custom_sounds), loaded_path)
+
+        for rest_device in self.rest_devices:
+            if not hasattr(rest_device, "sounds_by_name") or not hasattr(rest_device, "sounds_by_id"):
+                continue
+
+            for item in custom_sounds:
+                if not isinstance(item, dict):
+                    continue
+                sound_id = item.get("id")
+                title = item.get("title")
+                url = (
+                    item.get("url")
+                    or item.get("wavUrl")
+                    or item.get("mp3Url")
+                    or (f"https://assets.ctfassets.net/custom/{item.get('filename')}" if item.get("filename") else None)
+                )
+                if not sound_id or not title or not url:
+                    continue
+
+                sound_dict = {
+                    "id": sound_id,
+                    "title": title,
+                    "wavUrl": url,
+                    "mp3Url": url,
+                }
+                rest_device.sounds_by_name[title] = sound_dict
+                rest_device.sounds_by_id[sound_id] = sound_dict
+
     def _is_awscrt_connect_signature_mismatch(self, error: Exception) -> bool:
         if not isinstance(error, TypeError) or "argument" not in str(error):
             return False
@@ -286,6 +343,7 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
             )
             self.update_interval = datetime.fromtimestamp(self.expiration_time - 60, UTC) - datetime.now(UTC)
             self._clear_retry_backoff()
+            self._load_custom_sounds()
             for rest_device in self.rest_devices:
                 rest_device.register_callback(self.async_update_listeners)
             # Re-login replaces every RestDevice instance, so alarm-derived entities

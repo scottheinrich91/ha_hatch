@@ -23,6 +23,7 @@ A custom integration for Hatch Rest/Restore Sound Machines. This project is most
 - monitor device connectivity
 - start and stop sound machine with variety of built-in sounds (Rest mini & Rest+)
 - play favorites set in the Hatch app (Rest 2nd gen, Rest+ 2nd gen, Restore 3)
+- support for custom sound map definitions via `custom_sounds.json`
 - adjust the volume
 - monitor battery level (Rest+ & Rest+ 2nd gen)
 - adjust light brightness and color
@@ -51,6 +52,10 @@ If you receive an error, please go through these steps;
 You can now use the following services:
 * Rest+ 2nd gen: activate scene to start a defined favorite
   * if you add new favorites reload the integration to update available scenes or restart ha
+* Custom Sound Mapping:
+  * Place a `custom_sounds.json` file in `/config/custom_components/ha_hatch/` or `/config/hatch_custom_sounds.json`
+  * Format: `[{"id": 20001, "title": "Track Name", "filename": "audio.mp3"}]`
+  * Mapped tracks are automatically exposed as selectable sound modes in the media player entity.
 * Restore/Restore 2/Restore 3: use the alarm switch to enable or disable an existing alarm
   * use the alarm wake time entity to change when the alarm sound starts; the sunrise light start shifts with it
   * when Hatch omits an alarm `endTime`, wake time is derived from `startTime` plus the alarm sunrise duration

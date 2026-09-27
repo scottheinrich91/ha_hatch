@@ -51,17 +51,6 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
         super().__init__(
             coordinator=coordinator, thing_name=thing_name, entity_type="Media Player"
         )
-        audio_data = (
-            REST_IOT_AUDIO_TRACKS[1:]
-            if not isinstance(self.rest_device, RestBaby)
-            else REST_BABY_AUDIO_TRACKS[1:]
-        )
-        self._attr_sound_mode_list = sorted(
-            set(
-                [x.name for x in audio_data]
-                + list(self.rest_device.sounds_by_name.keys())
-            )
-        )
         self._attr_supported_features = (
             MediaPlayerEntityFeature.PLAY
             | MediaPlayerEntityFeature.STOP
@@ -71,6 +60,20 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
             | MediaPlayerEntityFeature.SELECT_SOURCE
         )
         self._attr_extra_state_attributes = {}
+
+    @property
+    def sound_mode_list(self) -> list[str]:
+        audio_data = (
+            REST_IOT_AUDIO_TRACKS[1:]
+            if not isinstance(self.rest_device, RestBaby)
+            else REST_BABY_AUDIO_TRACKS[1:]
+        )
+        custom_sounds = (
+            list(self.rest_device.sounds_by_name.keys())
+            if self.rest_device and hasattr(self.rest_device, "sounds_by_name")
+            else []
+        )
+        return sorted(set([x.name for x in audio_data] + custom_sounds))
 
     @property
     def state(self) -> MediaPlayerState | None:

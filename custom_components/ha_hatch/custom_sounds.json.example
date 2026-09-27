@@ -1,0 +1,20 @@
+[
+  {
+    "id": 20001,
+    "title": "Custom Track 01 - Daytime Ambient",
+    "filename": "custom_track_01.mp3",
+    "url": "https://assets.ctfassets.net/custom/custom_track_01.mp3"
+  },
+  {
+    "id": 20002,
+    "title": "Custom Track 02 - Evening Lullaby",
+    "filename": "custom_track_02.mp3",
+    "url": "https://assets.ctfassets.net/custom/custom_track_02.mp3"
+  },
+  {
+    "id": 20003,
+    "title": "Custom Track 03 - Gentle Piano",
+    "filename": "custom_track_03.mp3",
+    "url": "https://assets.ctfassets.net/custom/custom_track_03.mp3"
+  }
+]
