@@ -278,9 +278,12 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
         _LOGGER.info("Loaded %d custom sounds from %s", len(custom_sounds), loaded_path)
 
         for rest_device in self.rest_devices:
-            if not hasattr(rest_device, "sounds_by_name") or not hasattr(rest_device, "sounds_by_id"):
+            if not hasattr(rest_device, "sounds") or not isinstance(rest_device.sounds, list):
                 continue
 
+            existing_ids = {
+                s.get("id") for s in rest_device.sounds if isinstance(s, dict)
+            }
             for item in custom_sounds:
                 if not isinstance(item, dict):
                     continue
@@ -295,14 +298,14 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
                 if not sound_id or not title or not url:
                     continue
 
-                sound_dict = {
-                    "id": sound_id,
-                    "title": title,
-                    "wavUrl": url,
-                    "mp3Url": url,
-                }
-                rest_device.sounds_by_name[title] = sound_dict
-                rest_device.sounds_by_id[sound_id] = sound_dict
+                if sound_id not in existing_ids:
+                    rest_device.sounds.append({
+                        "id": sound_id,
+                        "title": title,
+                        "wavUrl": url,
+                        "mp3Url": url,
+                    })
+                    existing_ids.add(sound_id)
 
     def _is_awscrt_connect_signature_mismatch(self, error: Exception) -> bool:
         if not isinstance(error, TypeError) or "argument" not in str(error):
