@@ -17,6 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup(hass: HomeAssistant, _config):
+    _LOGGER.warning("HA_HATCH: async_setup called")
     from .services import async_register_services
 
     async_register_services(hass)
@@ -24,6 +25,7 @@ async def async_setup(hass: HomeAssistant, _config):
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry):
+    _LOGGER.warning("HA_HATCH: async_setup_entry called for %s", config_entry.entry_id)
     hass.data.setdefault(DOMAIN, {})
     email = config_entry.data[CONF_EMAIL]
     password = config_entry.data[CONF_PASSWORD]

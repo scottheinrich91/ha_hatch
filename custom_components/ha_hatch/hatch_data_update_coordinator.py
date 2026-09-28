@@ -8,53 +8,55 @@ import os
 import traceback
 from typing import Final
 
-from hatch_rest_api import RestDevice
+from awscrt.mqtt import Connection
+from hatch_rest_api import (
+    RestDevice,
+    get_rest_devices,
+)
 from hatch_rest_api.errors import AuthError, RateError
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryAuthFailed
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from custom_components.ha_hatch import DOMAIN
+from .const import DOMAIN
 
-_LOGGER: Logger = getLogger(__name__)
+_LOGGER: Final[Logger] = getLogger(__name__)
 
 ALARM_REFRESH_INTERVAL: Final = timedelta(minutes=10)
-MQTT_DISCONNECT_TIMEOUT: Final = 10
-MQTT_UNSUBSCRIBE_TIMEOUT: Final = 10
 DEFAULT_RETRY_INTERVAL: Final = timedelta(minutes=1)
 RATE_LIMIT_RETRY_INTERVAL: Final = timedelta(minutes=15)
 MAX_RATE_LIMIT_RETRY_INTERVAL: Final = timedelta(hours=6)
-AWSCRT_MISMATCH_RETRY_INTERVAL: Final = timedelta(hours=1)
-MAX_AWSCRT_MISMATCH_RETRY_INTERVAL: Final = timedelta(hours=12)
+AWSCRT_MISMATCH_RETRY_INTERVAL: Final = timedelta(minutes=15)
 AWSCRT_MISMATCH_TRACE_FILE: Final = "awscrt/mqtt.py"
-AWSCRT_MISMATCH_TRACE_NAME: Final = "connect"
-AlarmRefreshCallback = Callable[[], Awaitable[None] | None]
+AWSCRT_MISMATCH_TRACE_NAME: Final = "_on_connection_interrupted"
+
+AlarmRefreshCallback = Callable[[], None] | Callable[[], Awaitable[None]]
 
 
-class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
-    mqtt_connection = None
-    rest_devices: list[RestDevice] = []
-    expiration_time: float = None
-    _retry_backoff_until: dict[str, datetime] = {}
-    _retry_backoff_attempts: dict[str, int] = {}
-    _retry_backoff_reasons: dict[str, str] = {}
-
+class HatchDataUpdateCoordinator(DataUpdateCoordinator[list[dict]]):
     def __init__(
-            self,
-            hass: HomeAssistant,
-            email: str,
-            password: str,
-            config_entry: ConfigEntry,
+        self,
+        hass: HomeAssistant,
+        email: str,
+        password: str,
+        config_entry: ConfigEntry,
     ) -> None:
-        """Initialize the device."""
         self.email: str = email
         self.password: str = password
+        self.mqtt_connection: Connection | None = None
+        self.rest_devices: list[RestDevice] = []
+        self.expiration_time: int = 0
+        self.custom_sounds: list[dict] = []
+        self.custom_sounds_by_name: dict[str, dict] = {}
+        self.custom_sounds_by_id: dict[int, dict] = {}
         self._alarm_refresh_callbacks: set[AlarmRefreshCallback] = set()
-        self._alarm_refresh_lock = asyncio.Lock()
         self._alarm_refresh_unsub: Callable[[], None] | None = None
+        self._alarm_refresh_lock = asyncio.Lock()
+        self._retry_backoff_until: datetime | None = None
+        self._retry_backoff_reasons: set[str] = set()
 
         super().__init__(
             hass,
@@ -64,179 +66,78 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
             always_update=False,
         )
 
-    async def _async_unsubscribe_shadows(self) -> None:
-        # Every device holds two AWS IoT shadow subscriptions, and awscrt keeps
-        # a native reference to each subscription callback. Those references are
-        # invisible to Python's garbage collector, so dropping our own reference
-        # to the device is not enough to reclaim it -- the device, its shadow
-        # client and the TLS context underneath survive until the subscriptions
-        # go away. Skipping this stranded one connection graph per reconnect,
-        # which is hourly, for as long as the process ran.
-        #
-        # Has to happen before the disconnect below, while the connection can
-        # still carry the UNSUBSCRIBE, and off the event loop because the
-        # library call blocks waiting for each UNSUBACK.
-        if not self.rest_devices:
-            return
-
-        rest_devices = self.rest_devices
-
-        def _unsubscribe() -> None:
-            for rest_device in rest_devices:
-                rest_device.unsubscribe()
-
-        try:
-            await asyncio.wait_for(
-                self.hass.async_add_executor_job(_unsubscribe),
-                timeout=MQTT_UNSUBSCRIBE_TIMEOUT * 2,
-            )
-        except Exception as error:
-            # Best effort: a failure here costs memory, not correctness, and the
-            # reconnect matters more than the cleanup.
-            _LOGGER.error("shadow unsubscribe failed during teardown", exc_info=error)
-
-    async def _async_disconnect_mqtt(self) -> None:
-        # disconnect() returns a future that never resolves if the connection
-        # is already broken; waiting on it without a timeout on the event loop
-        # freezes all of Home Assistant.
+    def _disconnect_mqtt(self) -> None:
         if self.mqtt_connection is None:
             return
-        mqtt_connection = self.mqtt_connection
-        self.mqtt_connection = None
-
-        def _disconnect() -> None:
-            mqtt_connection.disconnect().result(timeout=MQTT_DISCONNECT_TIMEOUT)
 
         try:
-            await asyncio.wait_for(
-                self.hass.async_add_executor_job(_disconnect),
-                timeout=MQTT_DISCONNECT_TIMEOUT * 2,
-            )
+            self.mqtt_connection.disconnect()
         except Exception as error:
-            _LOGGER.error("mqtt_connection disconnect failed during reconnect", exc_info=error)
+            _LOGGER.debug(
+                "MQTT disconnect failed: %s",
+                error,
+            )
+        finally:
+            self.mqtt_connection = None
 
     def _rest_device_unsub(self) -> None:
         for rest_device in self.rest_devices:
             rest_device.remove_callback(self.async_update_listeners)
 
+    def rest_device_by_thing_name(self, thing_name: str) -> RestDevice | None:
+        return next(
+            (device for device in self.rest_devices if device.thing_name == thing_name),
+            None,
+        )
+
     def async_start_alarm_refresh(self) -> None:
         if self._alarm_refresh_unsub is not None:
             return
 
+        async def _refresh_alarms(_now: datetime) -> None:
+            await self._async_notify_alarm_refresh_callbacks()
+
         self._alarm_refresh_unsub = async_track_time_interval(
             self.hass,
-            self._async_handle_alarm_refresh_interval,
+            _refresh_alarms,
             ALARM_REFRESH_INTERVAL,
         )
 
     def async_add_alarm_refresh_callback(
-        self,
-        callback: AlarmRefreshCallback,
+        self, callback: AlarmRefreshCallback
     ) -> Callable[[], None]:
         self._alarm_refresh_callbacks.add(callback)
 
-        def remove_callback() -> None:
+        def _remove() -> None:
             self._alarm_refresh_callbacks.discard(callback)
 
-        return remove_callback
+        return _remove
 
-    async def _async_handle_alarm_refresh_interval(self, now: datetime) -> None:
-        try:
-            await self.async_refresh_alarms()
-        except Exception as error:
-            _LOGGER.exception(
-                "Unhandled error during scheduled Hatch alarm refresh",
-                exc_info=error,
-            )
+    async_register_alarm_refresh_callback = async_add_alarm_refresh_callback
 
-    async def async_refresh_alarms(self) -> None:
-        alarm_devices = [
-            rest_device
-            for rest_device in self.rest_devices
-            if (
-                getattr(rest_device, "alarm_capable", False)
-                or getattr(rest_device, "alarms_loaded", False)
-            )
-            and callable(getattr(rest_device, "refresh_alarms", None))
-        ]
-        if not alarm_devices:
+    async def _async_notify_alarm_refresh_callbacks(self) -> None:
+        if not self._alarm_refresh_callbacks:
             return
 
         async with self._alarm_refresh_lock:
-            refresh_results = await asyncio.gather(
-                *(rest_device.refresh_alarms() for rest_device in alarm_devices),
-                return_exceptions=True,
-            )
-
-        refreshed = False
-        for rest_device, result in zip(alarm_devices, refresh_results, strict=True):
-            if isinstance(result, Exception):
-                _LOGGER.warning(
-                    "Failed to refresh Hatch alarms for %s",
-                    rest_device.device_name,
-                    exc_info=result,
-                )
-                continue
-            refreshed = True
-
-        if refreshed:
-            await self._async_notify_alarm_refresh_callbacks()
-
-    async def _async_notify_alarm_refresh_callbacks(self) -> None:
-        for callback in tuple(self._alarm_refresh_callbacks):
-            try:
-                result = callback()
-                if isawaitable(result):
-                    await result
-            except Exception as error:
-                _LOGGER.exception(
-                    "Hatch alarm refresh callback failed",
-                    exc_info=error,
-                )
+            for callback in list(self._alarm_refresh_callbacks):
+                try:
+                    result = callback()
+                    if isawaitable(result):
+                        await result
+                except Exception as error:
+                    _LOGGER.error("Alarm refresh callback failed", exc_info=error)
 
     def _clear_retry_backoff(self) -> None:
-        self._retry_backoff_until.pop(self.email, None)
-        self._retry_backoff_attempts.pop(self.email, None)
-        self._retry_backoff_reasons.pop(self.email, None)
+        self._retry_backoff_reasons.clear()
+        self._retry_backoff_until = None
 
-    def _apply_retry_backoff(
-            self,
-            *,
-            reason: str,
-            error: Exception,
-            base_delay: timedelta,
-            maximum_delay: timedelta,
-            log_message: str,
-    ) -> None:
-        if self._retry_backoff_reasons.get(self.email) == reason:
-            attempts = self._retry_backoff_attempts.get(self.email, 0) + 1
-        else:
-            attempts = 1
-
-        delay_seconds = min(
-            base_delay.total_seconds() * (2 ** (attempts - 1)),
-            maximum_delay.total_seconds(),
-        )
-        delay = timedelta(seconds=delay_seconds)
-        retry_at = datetime.now(UTC) + delay
-
-        self._retry_backoff_reasons[self.email] = reason
-        self._retry_backoff_attempts[self.email] = attempts
-        self._retry_backoff_until[self.email] = retry_at
-        self.update_interval = delay
-
-        _LOGGER.warning(
-            "%s Retrying for %s at %s after %s consecutive %s failure(s).",
-            log_message,
-            self.email,
-            retry_at.isoformat(),
-            attempts,
-            reason,
-            exc_info=error,
-        )
+    def _set_retry_backoff(self, reason: str, retry_interval: timedelta) -> None:
+        self._retry_backoff_reasons.add(reason)
+        self._retry_backoff_until = datetime.now(UTC) + retry_interval
 
     def _raise_if_retry_backoff_active(self) -> None:
-        retry_at = self._retry_backoff_until.get(self.email)
+        retry_at = self._retry_backoff_until
         if retry_at is None:
             return
 
@@ -251,9 +152,6 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
 
     def _load_custom_sounds(self) -> None:
         """Load optional custom sound mapping from custom_sounds.json if present."""
-        if not self.rest_devices:
-            return
-
         config_paths = [
             self.hass.config.path("custom_components", "ha_hatch", "custom_sounds.json"),
             self.hass.config.path("hatch_custom_sounds.json"),
@@ -277,35 +175,52 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
 
         _LOGGER.info("Loaded %d custom sounds from %s", len(custom_sounds), loaded_path)
 
+        self.custom_sounds = custom_sounds
+        self.custom_sounds_by_name = {}
+        self.custom_sounds_by_id = {}
+
+        for item in custom_sounds:
+            if not isinstance(item, dict):
+                continue
+            sound_id = item.get("id")
+            title = item.get("title")
+            url = (
+                item.get("url")
+                or item.get("wavUrl")
+                or item.get("mp3Url")
+                or (f"https://assets.ctfassets.net/custom/{item.get('filename')}" if item.get("filename") else None)
+            )
+            if not sound_id or not title or not url:
+                continue
+
+            sound_dict = {
+                "id": sound_id,
+                "title": title,
+                "wavUrl": url,
+                "mp3Url": url,
+            }
+            self.custom_sounds_by_name[title] = sound_dict
+            self.custom_sounds_by_id[sound_id] = sound_dict
+
         for rest_device in self.rest_devices:
             if not hasattr(rest_device, "sounds") or not isinstance(rest_device.sounds, list):
-                continue
+                rest_device.sounds = []
+            if not hasattr(rest_device, "sounds_by_name") or not isinstance(rest_device.sounds_by_name, dict):
+                rest_device.sounds_by_name = {}
+            if not hasattr(rest_device, "sounds_by_id") or not isinstance(rest_device.sounds_by_id, dict):
+                rest_device.sounds_by_id = {}
 
             existing_ids = {
                 s.get("id") for s in rest_device.sounds if isinstance(s, dict)
             }
-            for item in custom_sounds:
-                if not isinstance(item, dict):
-                    continue
-                sound_id = item.get("id")
-                title = item.get("title")
-                url = (
-                    item.get("url")
-                    or item.get("wavUrl")
-                    or item.get("mp3Url")
-                    or (f"https://assets.ctfassets.net/custom/{item.get('filename')}" if item.get("filename") else None)
-                )
-                if not sound_id or not title or not url:
-                    continue
-
+            for title, sound_dict in self.custom_sounds_by_name.items():
+                sound_id = sound_dict["id"]
                 if sound_id not in existing_ids:
-                    rest_device.sounds.append({
-                        "id": sound_id,
-                        "title": title,
-                        "wavUrl": url,
-                        "mp3Url": url,
-                    })
+                    rest_device.sounds.append(sound_dict)
                     existing_ids.add(sound_id)
+
+                rest_device.sounds_by_name[title] = sound_dict
+                rest_device.sounds_by_id[sound_id] = sound_dict
 
     def _is_awscrt_connect_signature_mismatch(self, error: Exception) -> bool:
         if not isinstance(error, TypeError) or "argument" not in str(error):
@@ -321,20 +236,23 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
         self._raise_if_retry_backoff_active()
         try:
             _LOGGER.debug(f"_async_update_data: {self.email}")
-            await self._async_unsubscribe_shadows()
-            await self._async_disconnect_mqtt()
-            self._rest_device_unsub()
-
-            from hatch_rest_api import get_rest_devices
+            self._disconnect_mqtt()
 
             def disconnect():
-                _LOGGER.debug("disconnected")
+                _LOGGER.debug(f"disconnected: {self.email}")
 
-            def resumed():
-                _LOGGER.debug("resumed")
+            def resumed(return_code, session_present):
+                _LOGGER.debug(
+                    f"resumed: {self.email}, return_code: {return_code}, session_present: {session_present}"
+                )
 
             client_session = async_get_clientsession(self.hass)
-            _, self.mqtt_connection, self.rest_devices, self.expiration_time = await get_rest_devices(
+            (
+                _,
+                self.mqtt_connection,
+                self.rest_devices,
+                self.expiration_time,
+            ) = await get_rest_devices(
                 email=self.email,
                 password=self.password,
                 client_session=client_session,
@@ -359,48 +277,33 @@ class HatchDataUpdateCoordinator(DataUpdateCoordinator[dict]):
                 "Hatch credentials rejected during setup"
             ) from error
         except RateError as error:
-            self._apply_retry_backoff(
-                reason="rate_limit",
-                error=error,
-                base_delay=RATE_LIMIT_RETRY_INTERVAL,
-                maximum_delay=MAX_RATE_LIMIT_RETRY_INTERVAL,
-                log_message=(
-                    "Hatch API rate limit exceeded. Delaying future login attempts to "
-                    "avoid burning additional requests."
-                ),
-            )
-            raise UpdateFailed(error) from error
+            self._set_retry_backoff("rate_limit", RATE_LIMIT_RETRY_INTERVAL)
+            raise UpdateFailed(
+                f"Hatch API rate limit active for {self.email}; retrying in {RATE_LIMIT_RETRY_INTERVAL}"
+            ) from error
         except Exception as error:
             if self._is_awscrt_connect_signature_mismatch(error):
-                self._apply_retry_backoff(
-                    reason="awscrt_signature_mismatch",
-                    error=error,
-                    base_delay=AWSCRT_MISMATCH_RETRY_INTERVAL,
-                    maximum_delay=MAX_AWSCRT_MISMATCH_RETRY_INTERVAL,
-                    log_message=(
-                        "Detected an awscrt Python/native MQTT signature mismatch. "
-                        "Delaying retries because repeated setup attempts will keep "
-                        "hitting Hatch login while this environment is broken."
-                    ),
+                self._set_retry_backoff("awscrt_mismatch", AWSCRT_MISMATCH_RETRY_INTERVAL)
+                _LOGGER.error(
+                    "AWS CRT connection signature mismatch for %s; backing off for %s",
+                    self.email,
+                    AWSCRT_MISMATCH_RETRY_INTERVAL,
+                    exc_info=error,
                 )
-                raise UpdateFailed(error) from error
-            _LOGGER.exception(error)
-            self.update_interval = DEFAULT_RETRY_INTERVAL
-            raise UpdateFailed(error) from error
+                raise UpdateFailed(
+                    f"AWS CRT connection signature mismatch for {self.email}; backing off for {AWSCRT_MISMATCH_RETRY_INTERVAL}"
+                ) from error
+
+            self._clear_retry_backoff()
+            raise UpdateFailed(
+                f"Unknown error connecting to Hatch: {error}"
+            ) from error
 
     async def async_shutdown(self) -> None:
-        """Cancel any scheduled call, and ignore new runs."""
         if self._alarm_refresh_unsub is not None:
             self._alarm_refresh_unsub()
             self._alarm_refresh_unsub = None
         self._alarm_refresh_callbacks.clear()
-        await self._async_unsubscribe_shadows()
-        await self._async_disconnect_mqtt()
+        self._disconnect_mqtt()
         self._rest_device_unsub()
         await super().async_shutdown()
-
-    def rest_device_by_thing_name(self, thing_name: str) -> RestDevice | None:
-        return next(
-            (rest_device for rest_device in self.rest_devices if rest_device.thing_name == thing_name),
-            None
-        )

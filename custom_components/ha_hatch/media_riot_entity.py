@@ -6,41 +6,24 @@ from homeassistant.components.media_player import (
     MediaPlayerEntity,
     MediaPlayerDeviceClass,
     MediaPlayerState,
+    MediaType,
 )
-from homeassistant.components.media_player.const import (
-    MediaPlayerEntityFeature,
-    MediaType
-)
-from homeassistant.const import (
-    STATE_IDLE,
-    STATE_PLAYING,
+from homeassistant.components.media_player.const import MediaPlayerEntityFeature
+from hatch_rest_api import (
+    REST_IOT_AUDIO_TRACKS,
+    REST_BABY_AUDIO_TRACKS,
+    RIoTAudioTrack,
+    RestBabyAudioTrack,
+    RestBaby,
 )
 
 from . import HatchDataUpdateCoordinator
 from .hatch_entity import HatchEntity
-from hatch_rest_api import (
-    REST_IOT_AUDIO_TRACKS,
-    RIoTAudioTrack,
-    RestBabyAudioTrack,
-    REST_BABY_AUDIO_TRACKS,
-    RestBaby,
-)
 
 _LOGGER = logging.getLogger(__name__)
 
-
-def _find_track(track_name) -> RIoTAudioTrack | None:
-    return next(
-        (track for track in REST_IOT_AUDIO_TRACKS if track.name == track_name),
-        None,
-    )
-
-
-def _find_rest_baby_track(track_name) -> RestBabyAudioTrack | None:
-    return next(
-        (track for track in REST_BABY_AUDIO_TRACKS if track.name == track_name),
-        None,
-    )
+STATE_PLAYING: MediaPlayerState = MediaPlayerState.PLAYING
+STATE_IDLE: MediaPlayerState = MediaPlayerState.IDLE
 
 
 class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
@@ -63,21 +46,27 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
 
     @property
     def sound_mode_list(self) -> list[str]:
+        _LOGGER.warning(
+            "CALLING sound_mode_list: coordinator=%s, has_attr=%s, count=%d",
+            self.coordinator,
+            hasattr(self.coordinator, "custom_sounds_by_name"),
+            len(getattr(self.coordinator, "custom_sounds_by_name", {})),
+        )
         audio_data = (
             REST_IOT_AUDIO_TRACKS[1:]
             if not isinstance(self.rest_device, RestBaby)
             else REST_BABY_AUDIO_TRACKS[1:]
         )
-        custom_sounds = (
-            list(self.rest_device.sounds_by_name.keys())
-            if self.rest_device and hasattr(self.rest_device, "sounds_by_name")
-            else []
-        )
+        custom_sounds = []
+        if hasattr(self.coordinator, "custom_sounds_by_name") and self.coordinator.custom_sounds_by_name:
+            custom_sounds = list(self.coordinator.custom_sounds_by_name.keys())
+        elif self.rest_device and hasattr(self.rest_device, "sounds_by_name") and self.rest_device.sounds_by_name:
+            custom_sounds = list(self.rest_device.sounds_by_name.keys())
         return sorted(set([x.name for x in audio_data] + custom_sounds))
 
     @property
     def state(self) -> MediaPlayerState | None:
-        if self.rest_device.is_playing:
+        if self.rest_device and self.rest_device.is_playing:
             return STATE_PLAYING
         else:
             return STATE_IDLE
@@ -85,56 +74,132 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
     @property
     def sound_mode(self) -> str | None:
         _LOGGER.debug("looking up sound mode")
+        if not self.rest_device:
+            return None
         if hasattr(self.rest_device, "audio_track") and self.rest_device.audio_track is not None:
-            _LOGGER.debug("Audio track found: %s", self.rest_device.audio_track)
-            sound_mode = self.rest_device.audio_track.name
+            if hasattr(self.rest_device.audio_track, "name"):
+                return self.rest_device.audio_track.name
+            track_val = (
+                self.rest_device.audio_track.value
+                if hasattr(self.rest_device.audio_track, "value")
+                else self.rest_device.audio_track
+            )
+            if hasattr(self.rest_device, "sounds_by_id") and track_val in self.rest_device.sounds_by_id:
+                return self.rest_device.sounds_by_id[track_val].get("title")
+            if hasattr(self.coordinator, "custom_sounds_by_id") and track_val in self.coordinator.custom_sounds_by_id:
+                return self.coordinator.custom_sounds_by_id[track_val].get("title")
+            return str(self.rest_device.audio_track)
         else:
-            sound = self.rest_device.sounds_by_id.get(self.rest_device.sound_id) or {}
-            sound_mode = sound.get('title') or None
-        _LOGGER.debug("sound mode: %s", sound_mode)
-        return sound_mode
+            return None
 
     @property
     def volume_level(self) -> float | None:
+        if not self.rest_device:
+            return None
         return self.rest_device.volume / 100
 
     @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
-        return {
-            "current": self.rest_device.current_playing,
-            "current_step": self.rest_device.current_step,
-            "current_favorite": self.rest_device.current_id,
-            "current_favorite_name": next((
-                f["steps"][0]["name"] for f
-                in self.rest_device.favorites
-                if f["id"] == self.rest_device.current_id
-            ), None),
-        }
+        if not self.rest_device:
+            return {}
+        attrs: dict[str, Any] = {}
+        if hasattr(self.rest_device, "current"):
+            attrs["current"] = getattr(self.rest_device, "current", None)
+        if hasattr(self.rest_device, "current_step"):
+            attrs["current_step"] = getattr(self.rest_device, "current_step", None)
+        if hasattr(self.rest_device, "current_favorite"):
+            attrs["current_favorite"] = getattr(self.rest_device, "current_favorite", None)
+        return attrs
 
-    def set_volume_level(self, volume):
-        self.rest_device.set_volume(volume * 100)
+    def set_volume_level(self, volume: float) -> None:
+        if not self.rest_device:
+            return
+        self.rest_device.set_volume(round(volume * 100))
 
     def media_play(self) -> None:
-        _LOGGER.debug("media play")
-        if self.rest_device.is_playing:
+        if not self.rest_device:
+            return
+        if self.state == STATE_PLAYING:
             _LOGGER.debug("media player already playing")
             return
-        new_sound_mode = self.sound_mode or self._attr_sound_mode_list[0]
+        new_sound_mode = self.sound_mode or self.sound_mode_list[0]
         _LOGGER.debug("selecting sound mode of %s", new_sound_mode)
         self.select_sound_mode(new_sound_mode)
 
     def select_sound_mode(self, sound_mode: str) -> None:
         _LOGGER.debug("Select sound mode: %s", sound_mode)
-        if isinstance(self.rest_device, RestBaby):
-            track = _find_rest_baby_track(track_name=sound_mode)
+        if not self.rest_device:
+            return
+
+        if hasattr(self.rest_device, "sounds_by_name") and sound_mode in self.rest_device.sounds_by_name:
+            sound = self.rest_device.sounds_by_name[sound_mode]
+            url = sound.get("wavUrl") or sound.get("mp3Url") or sound.get("url")
+            self.rest_device.set_sound_url(url)
+        elif hasattr(self.coordinator, "custom_sounds_by_name") and sound_mode in self.coordinator.custom_sounds_by_name:
+            sound = self.coordinator.custom_sounds_by_name[sound_mode]
+            url = (
+                sound.get("wavUrl")
+                or sound.get("mp3Url")
+                or sound.get("url")
+                or (f"https://assets.ctfassets.net/custom/{sound.get('filename')}" if sound.get("filename") else None)
+            )
+            self.rest_device.set_sound_url(url)
         else:
-            track = _find_track(track_name=sound_mode)
-        if track is None:
-            _LOGGER.debug("No track found")
-            self.rest_device.set_sound(sound_mode)
-        else:
-            _LOGGER.debug("set audio track: %s", track)
+            track = self._find_track(sound_mode=sound_mode)
+            if track is None:
+                track = self.none_track
             self.rest_device.set_audio_track(track)
 
-    def media_stop(self):
+    def media_stop(self) -> None:
+        if not self.rest_device:
+            return
         self.rest_device.turn_off()
+
+    def select_source(self, source: str) -> None:
+        if not self.rest_device:
+            return
+        self.rest_device.set_favorite(source)
+
+    @property
+    def source_list(self) -> list[str]:
+        if not self.rest_device:
+            return []
+        return self.rest_device.favorite_names()
+
+    @property
+    def source(self) -> str | None:
+        if not self.rest_device:
+            return None
+        if self.rest_device.is_playing:
+            return self.rest_device.favorite_name(
+                self.rest_device.current_favorite
+            )
+        else:
+            return None
+
+    @property
+    def none_track(self) -> RIoTAudioTrack | RestBabyAudioTrack:
+        if isinstance(self.rest_device, RestBaby):
+            return RestBabyAudioTrack.NONE
+        else:
+            return RIoTAudioTrack.NONE
+
+    def _find_track(self, sound_mode: str) -> RIoTAudioTrack | RestBabyAudioTrack | None:
+        if isinstance(self.rest_device, RestBaby):
+            return next(
+                (
+                    track
+                    for track in REST_BABY_AUDIO_TRACKS
+                    if track.name == sound_mode
+                ),
+                None,
+            )
+        else:
+            return next(
+                (
+                    track
+                    for track in REST_IOT_AUDIO_TRACKS
+                    if track.name == sound_mode
+                ),
+                None,
+            )
