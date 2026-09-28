@@ -131,24 +131,24 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
         if not self.rest_device:
             return
 
+        track = self._find_track(sound_mode=sound_mode)
+        if track is not None:
+            _LOGGER.info("Setting stock audio track: %s (%s)", sound_mode, track)
+            self.rest_device.set_audio_track(track)
+            return
+
+        sound = None
         if hasattr(self.rest_device, "sounds_by_name") and sound_mode in self.rest_device.sounds_by_name:
             sound = self.rest_device.sounds_by_name[sound_mode]
-            url = sound.get("wavUrl") or sound.get("mp3Url") or sound.get("url")
-            self.rest_device.set_sound_url(url)
         elif hasattr(self.coordinator, "custom_sounds_by_name") and sound_mode in self.coordinator.custom_sounds_by_name:
             sound = self.coordinator.custom_sounds_by_name[sound_mode]
-            url = (
-                sound.get("wavUrl")
-                or sound.get("mp3Url")
-                or sound.get("url")
-                or (f"https://assets.ctfassets.net/custom/{sound.get('filename')}" if sound.get("filename") else None)
-            )
+
+        if sound:
+            url = sound.get("wavUrl") or sound.get("mp3Url") or sound.get("url")
+            _LOGGER.info("Dispatching custom sound %s (id=%s, url=%s)", sound_mode, sound.get("id"), url)
             self.rest_device.set_sound_url(url)
         else:
-            track = self._find_track(sound_mode=sound_mode)
-            if track is None:
-                track = self.none_track
-            self.rest_device.set_audio_track(track)
+            self.rest_device.set_audio_track(self.none_track)
 
     def media_stop(self) -> None:
         if not self.rest_device:
@@ -170,12 +170,12 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
     def source(self) -> str | None:
         if not self.rest_device:
             return None
-        if self.rest_device.is_playing:
-            return self.rest_device.favorite_name(
-                self.rest_device.current_favorite
-            )
-        else:
-            return None
+        if hasattr(self.rest_device, "favorite_names") and self.rest_device.is_playing:
+            favs = self.rest_device.favorite_names()
+            fav_id = getattr(self.rest_device, "current_favorite", 0)
+            if isinstance(fav_id, int) and 0 <= fav_id < len(favs):
+                return favs[fav_id]
+        return None
 
     @property
     def none_track(self) -> RIoTAudioTrack | RestBabyAudioTrack:
