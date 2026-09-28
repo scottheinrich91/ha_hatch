@@ -145,8 +145,21 @@ class MediaRiotEntity(HatchEntity, MediaPlayerEntity):
 
         if sound:
             url = sound.get("wavUrl") or sound.get("mp3Url") or sound.get("url")
-            _LOGGER.info("Dispatching custom sound %s (id=%s, url=%s)", sound_mode, sound.get("id"), url)
-            self.rest_device.set_sound_url(url)
+            sound_id = sound.get("id", 30468)
+            _LOGGER.info("Dispatching custom sound %s (id=%s, url=%s)", sound_mode, sound_id, url)
+            self.rest_device._update({
+                "current": {
+                    "playing": "remote",
+                    "step": 0,
+                    "sound": {
+                        "id": sound_id,
+                        "mute": False,
+                        "url": url,
+                        "duration": 0,
+                        "until": "indefinite",
+                    },
+                }
+            })
         else:
             self.rest_device.set_audio_track(self.none_track)
 
